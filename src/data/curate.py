@@ -237,9 +237,8 @@ def refine_shona_dataset():
     refined_dict.save_to_disk("/refined/sna_refined_v1")
     refined_vol.commit()
     
-    repo_id = f"{os.environ['HF_USERNAME']}/sna-tts-refined-v1"
-    refined_dict.push_to_hub(repo_id)
-    print(f"✅ Refined data available at {repo_id} and in sna-refined-vol")
+    # HF Upload removed completely!
+    print("✅ Curation complete! Refined data safely stored in sna-refined-vol at /refined/sna_refined_v1")
 
 if __name__ == "__main__":
     refine_shona_dataset.remote()
