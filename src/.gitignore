@@ -129,6 +129,9 @@ dmypy.json
 # VS Code
 .vscode/
 
+# Local reference clones
+/.local_refs/
+
 # macOS
 .DS_Store
 /test_samples
