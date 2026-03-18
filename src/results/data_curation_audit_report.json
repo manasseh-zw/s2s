@@ -1,0 +1,19 @@
+{
+    "project": "Shona S2S Dataset",
+    "stage": "Final Refined V2",
+    "timestamp": "2026-03-18 13:14:59",
+    "total_clips": 5000,
+    "total_speech_hours": 21.66,
+    "splits": {
+        "train": 4000,
+        "test": 500,
+        "valid": 500
+    },
+    "acoustic_metrics": {
+        "mean_snr_db": 77.88,
+        "std_snr_db": 4.17,
+        "max_snr_db": 89.6,
+        "min_snr_db": 71.66
+    },
+    "text_normalization": "lowercase, alphanumeric + basic punctuation, smart apostrophe fusion"
+}
