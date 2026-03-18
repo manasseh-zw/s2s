@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -18,6 +19,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
+from audit import AuditLogger, collect_environment_snapshot
 from dataloaders import create_dataloaders
 from utils import (
     MIMI_SAMPLE_RATE,
@@ -61,6 +63,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def load_config(config_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def build_run_manifest(args: argparse.Namespace, config: dict, device: torch.device) -> dict:
+    return {
+        "args": vars(args),
+        "config": config,
+        "device": str(device),
+        "environment": collect_environment_snapshot(),
+    }
 
 
 def resolve_generation_sentences(raw_value: str) -> list[str]:
@@ -107,6 +118,7 @@ def run_generation(
     args: argparse.Namespace,
     device: torch.device,
     step: int,
+    audit_logger: AuditLogger,
 ) -> None:
     for index, sentence in enumerate(resolve_generation_sentences(args.gen_sentences)):
         audio = generate_audio(
@@ -123,9 +135,23 @@ def run_generation(
             {f"audio_{index}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)},
             step=step,
         )
+        audit_logger.log_event(
+            "generation_sample",
+            step=step,
+            sample_index=index,
+            sentence=sentence,
+            sample_rate=MIMI_SAMPLE_RATE,
+            audio_num_samples=int(len(audio)),
+            audio_duration_sec=float(len(audio) / MIMI_SAMPLE_RATE),
+        )
 
 
-def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> float:
+def train_loop(
+    args: argparse.Namespace,
+    config: dict,
+    device: torch.device,
+    audit_logger: AuditLogger,
+) -> float:
     if wandb.run is None:
         raise RuntimeError("W&B must be initialized before calling train_loop")
 
@@ -165,11 +191,20 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
     early_stopped = False
     train_losses: list[float] = []
     progress = tqdm(total=total_steps, desc="Training")
+    audit_logger.log_event(
+        "training_started",
+        total_steps=total_steps,
+        epochs=args.n_epochs,
+        train_batches=len(train_loader),
+        val_batches=len(val_loader),
+        warmup_steps=warmup_steps,
+    )
 
     step = 0
     for epoch in range(args.n_epochs):
         model.train()
         for tokens, tokens_mask in train_loader:
+            step_start_time = time.perf_counter()
             tokens = tokens.to(device)
             tokens_mask = tokens_mask.to(device)
 
@@ -179,23 +214,50 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
 
             scaler.scale(scaled_loss).backward()
             train_losses.append(float(loss.item()))
+            grad_norm = None
 
             if (step + 1) % config["grad_acc_steps"] == 0:
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), config["max_grad_norm"])
+                grad_norm = float(
+                    clip_grad_norm_(model.parameters(), config["max_grad_norm"]).item()
+                )
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
             if step % config["log_every"] == 0:
+                train_loss_avg = sum(train_losses) / len(train_losses)
+                step_duration = time.perf_counter() - step_start_time
+                tokens_per_batch = int(tokens.shape[0])
+                sequence_length = int(tokens.shape[1])
+                metrics = {
+                    "train_loss_avg": train_loss_avg,
+                    "train_loss": float(loss.item()),
+                    "epoch": epoch,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                    "step_time_sec": step_duration,
+                    "samples_per_sec": float(tokens_per_batch / max(step_duration, 1e-6)),
+                    "batch_size_actual": tokens_per_batch,
+                    "sequence_length": sequence_length,
+                }
+                if grad_norm is not None:
+                    metrics["grad_norm"] = grad_norm
+                if torch.cuda.is_available():
+                    metrics["cuda_memory_allocated_mb"] = float(
+                        torch.cuda.memory_allocated(device) / (1024**2)
+                    )
+                    metrics["cuda_memory_reserved_mb"] = float(
+                        torch.cuda.memory_reserved(device) / (1024**2)
+                    )
                 wandb.log(
-                    {
-                        "train_loss_avg": sum(train_losses) / len(train_losses),
-                        "epoch": epoch,
-                        "learning_rate": optimizer.param_groups[0]["lr"],
-                    },
+                    metrics,
                     step=step,
+                )
+                audit_logger.log_event(
+                    "train_metrics",
+                    step=step,
+                    **metrics,
                 )
                 train_losses.clear()
 
@@ -211,11 +273,23 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
                     epoch,
                     step,
                 )
-                save_checkpoint(state, args.output_dir, f"model_step_{step}.pt")
+                checkpoint_name = f"model_step_{step}.pt"
+                save_checkpoint(state, args.output_dir, checkpoint_name)
+                audit_logger.log_event(
+                    "checkpoint_saved",
+                    step=step,
+                    epoch=epoch,
+                    checkpoint=checkpoint_name,
+                )
 
             if step % config["val_every"] == 0 or step == total_steps - 1:
+                validation_start = time.perf_counter()
                 val_loss = validate(model, val_loader, device, use_amp=args.use_amp)
-                wandb.log({"val_loss": val_loss}, step=step)
+                validation_metrics = {
+                    "val_loss": val_loss,
+                    "validation_time_sec": time.perf_counter() - validation_start,
+                }
+                wandb.log(validation_metrics, step=step)
 
                 if val_loss < best_val_loss - config.get("early_stopping_min_delta", 0.0):
                     best_val_loss = val_loss
@@ -232,9 +306,20 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
                         step,
                     )
                     save_checkpoint(state, args.output_dir, "model_bestval.pt")
+                    validation_metrics["best_val_loss"] = best_val_loss
+                    validation_metrics["new_best"] = True
                 else:
                     stale_validations += 1
+                    validation_metrics["best_val_loss"] = best_val_loss
+                    validation_metrics["new_best"] = False
 
+                validation_metrics["stale_validations"] = stale_validations
+                audit_logger.log_event(
+                    "validation",
+                    step=step,
+                    epoch=epoch,
+                    **validation_metrics,
+                )
                 model.train()
                 progress.set_postfix(
                     train_loss=f"{loss.item():.4f}",
@@ -245,6 +330,13 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
                 if patience and stale_validations >= patience:
                     early_stopped = True
                     wandb.log({"early_stopped": 1}, step=step)
+                    audit_logger.log_event(
+                        "early_stopping_triggered",
+                        step=step,
+                        epoch=epoch,
+                        patience=patience,
+                        best_val_loss=best_val_loss,
+                    )
                     break
             else:
                 progress.set_postfix(
@@ -261,6 +353,7 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
                     args,
                     device,
                     step,
+                    audit_logger,
                 )
                 model.train()
 
@@ -284,6 +377,21 @@ def train_loop(args: argparse.Namespace, config: dict, device: torch.device) -> 
         step,
     )
     save_checkpoint(final_state, args.output_dir, "model_final.pt")
+    audit_logger.log_event(
+        "training_finished",
+        final_step=step,
+        final_epoch=epoch,
+        best_val_loss=best_val_loss,
+        early_stopped=early_stopped,
+    )
+    audit_logger.update_summary(
+        status="completed",
+        best_val_loss=best_val_loss,
+        final_step=step,
+        final_epoch=epoch,
+        early_stopped=early_stopped,
+        ended_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
     return best_val_loss
 
 
@@ -294,6 +402,10 @@ def main(argv: list[str] | None = None) -> float:
 
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    audit_logger = AuditLogger(
+        run_dir=args.output_dir,
+        manifest=build_run_manifest(args, config, device),
+    )
 
     wandb.init(
         project=args.wandb_project,
@@ -301,11 +413,24 @@ def main(argv: list[str] | None = None) -> float:
         config={**config, **vars(args)},
         dir=args.output_dir / "wandb",
     )
+    audit_logger.log_event(
+        "wandb_initialized",
+        project=args.wandb_project,
+        run_name=wandb.run.name if wandb.run else None,
+        run_id=wandb.run.id if wandb.run else None,
+    )
 
     try:
-        best_val_loss = train_loop(args, config, device)
+        best_val_loss = train_loop(args, config, device, audit_logger)
         wandb.log({"best_val_loss": best_val_loss})
         return best_val_loss
+    except Exception as exc:
+        audit_logger.log_event("training_error", error=str(exc))
+        audit_logger.update_summary(
+            status="failed",
+            ended_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        raise
     finally:
         wandb.finish()
 

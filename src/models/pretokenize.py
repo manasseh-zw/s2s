@@ -8,14 +8,16 @@ for an in-memory `datasets` workflow with no temporary WAV materialization.
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from pathlib import Path
 
-import h5py
+import h5py  # type: ignore[import-untyped]
 import numpy as np
 import torch
-import torchaudio
-from datasets import Dataset, DatasetDict, load_from_disk
-from tqdm import tqdm
+import torchaudio  # type: ignore[import-untyped]
+from datasets import Dataset, DatasetDict, load_from_disk  # type: ignore[import-untyped]
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from utils import AUDIO_NUM_CODEBOOKS, MIMI_SAMPLE_RATE, load_tokenizers
 
@@ -24,6 +26,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_path", type=Path, default=Path("/refined/sna_refined_v2"))
     parser.add_argument("--output", type=Path, default=Path("/checkpoints/tokens/sna_refined_v2.hdf5"))
+    parser.add_argument("--audit_path", type=Path, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--valid_split", default="valid")
@@ -134,15 +137,17 @@ def tokenize_split(
     text_tokenizer,
     device: torch.device,
     save_every: int,
-) -> None:
+) -> dict[str, int | str]:
     audio_tokens_batch: list[np.ndarray] = []
     text_tokens_batch: list[np.ndarray] = []
+    examples_processed = 0
 
     with torch.inference_mode():
         for example in tqdm(dataset_split, desc=f"Tokenizing {output_split}"):
             waveform = prepare_waveform(example["audio"], device)
             audio_tokens = audio_tokenizer.encode(waveform)[0]
             text_tokens = text_tokenizer.encode(format_text(example["transcription"]))
+            examples_processed += 1
 
             audio_tokens_batch.append(
                 audio_tokens.detach().cpu().numpy().astype(np.int32).reshape(-1)
@@ -157,10 +162,22 @@ def tokenize_split(
     if audio_tokens_batch:
         append_to_hdf5(output_path, output_split, audio_tokens_batch, text_tokens_batch)
 
+    return {
+        "examples_processed": examples_processed,
+        "output_split": output_split,
+    }
+
+
+def write_audit_summary(audit_path: Path, payload: dict) -> None:
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
 
 def main(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    audit_path = args.audit_path or args.output.with_suffix(".audit.json")
+    started_at = time.time()
 
     if args.output.exists():
         if not args.overwrite:
@@ -177,7 +194,7 @@ def main(argv: list[str] | None = None) -> Path:
     valid_split_name = resolve_validation_split(dataset, args.valid_split)
     text_tokenizer, audio_tokenizer = load_tokenizers(device)
 
-    tokenize_split(
+    train_summary = tokenize_split(
         dataset[args.train_split],
         output_path=args.output,
         output_split="train",
@@ -186,7 +203,7 @@ def main(argv: list[str] | None = None) -> Path:
         device=device,
         save_every=args.save_every,
     )
-    tokenize_split(
+    val_summary = tokenize_split(
         dataset[valid_split_name],
         output_path=args.output,
         output_split="val",
@@ -195,6 +212,22 @@ def main(argv: list[str] | None = None) -> Path:
         device=device,
         save_every=args.save_every,
     )
+
+    audit_summary = {
+        "dataset_path": str(args.dataset_path),
+        "output_path": str(args.output),
+        "device": str(device),
+        "train_split_name": args.train_split,
+        "valid_split_name": valid_split_name,
+        "save_every": args.save_every,
+        "started_at_unix": started_at,
+        "elapsed_sec": time.time() - started_at,
+        "splits": {
+            "train": train_summary,
+            "val": val_summary,
+        },
+    }
+    write_audit_summary(audit_path, audit_summary)
 
     print(f"Saved tokenized train/val splits to {args.output}")
     return args.output
