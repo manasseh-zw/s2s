@@ -1,154 +1,245 @@
 import modal
 import os
-import logging
+import numpy as np
+import heapq
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+app = modal.App("sna-data-refinery")
+raw_vol = modal.Volume.from_name("sna-raw-vol")
+refined_vol = modal.Volume.from_name("sna-refined-vol")
 
-app = modal.App("shona-data-refinery")
-
-# Added webrtcvad to the pip installs
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .pip_install("datasets", "huggingface_hub", "soundfile", "librosa", "numpy", "python-dotenv", "webrtcvad")
+    .apt_install("ffmpeg")
+    .pip_install("datasets[audio]", "librosa", "webrtcvad", "soundfile", "torchcodec")
 )
 
 @app.function(
-    image=image, 
+    image=image,
     cpu=8.0, 
-    memory=16384, 
+    memory=16384,
     timeout=7200,
+    volumes={"/raw": raw_vol, "/refined": refined_vol},
     secrets=[modal.Secret.from_dotenv()]
 )
-def curate_and_push_dataset():
-    import numpy as np
-    import librosa
+def refine_shona_dataset():
+    from datasets import load_from_disk, Dataset, DatasetDict
     import webrtcvad
-    from datasets import load_dataset
-    from huggingface_hub import login
-    
-    hf_token = os.environ.get("HF_TOKEN")
-    hf_user = os.environ.get("HF_USERNAME")
-    
-    if not hf_token or not hf_user:
-        logger.error("❌ Missing environment variables! Check HF_TOKEN and HF_USERNAME in .env")
-        return
+    import librosa
 
-    logger.info(f"✅ HF_TOKEN detected (starts with: {hf_token[:4]}...)")
-    login(token=hf_token)
+    print("🚀 Loading raw records from sna-raw-vol...")
+    dataset = load_from_disk("/raw/sna_raw_v1")
 
-    print("🚀 Downloading Google's WaxalNLP Shona dataset (train split)...")
-    dataset = load_dataset("google/WaxalNLP", "sna_asr", split="train")
+    vad = webrtcvad.Vad(2)
+    TARGET_SR = 16000
+    FRAME_MS = 30
+    FRAME_LEN = int(TARGET_SR * FRAME_MS / 1000)
 
-    # ==========================================
-    # LAYER 1: The Length Filter (5.0s - 22.0s)
-    # ==========================================
-    dataset = dataset.filter(
-        lambda x: 5.0 <= (len(x["audio"]["array"]) / x["audio"]["sampling_rate"]) <= 22.0, 
-        num_proc=8
-    )
-    print(f"🧹 Rows after length filter: {len(dataset)}")
+    def smooth_vad_mask(mask, min_speech_frames=3, bridge_gap_frames=2):
+        mask = mask.copy()
+        if mask.size == 0:
+            return mask
 
-    # ==========================================
-    # LAYER 2: The WebRTC VAD Quality Scoring
-    # ==========================================
-    def calculate_quality(example):
-        TARGET_SR = 16000 # WebRTC strictly requires 16kHz or 32kHz
-        VAD_MODE = 3      # 3 is the most aggressive filter for weeding out noise
-        INVALID_SCORE = -999.0
-        EPSILON = 1e-10
-        
-        # WebRTC requires exact 10, 20, or 30ms frames. We use 30ms.
-        frame_duration_ms = 30
-        frame_length = int(TARGET_SR * frame_duration_ms / 1000) # 480 samples
+        start = None
+        runs = []
+        for i, value in enumerate(mask):
+            if value and start is None:
+                start = i
+            elif not value and start is not None:
+                runs.append((start, i))
+                start = None
+        if start is not None:
+            runs.append((start, len(mask)))
 
-        def invalid_clip(reason):
-            return {
-                "snr_score": INVALID_SCORE, "quality_score": INVALID_SCORE,
-                "speech_seconds": 0.0, "speech_ratio": 0.0, "noise_source": reason
-            }
+        for run_start, run_end in runs:
+            if (run_end - run_start) < min_speech_frames:
+                mask[run_start:run_end] = False
 
-        audio = np.array(example["audio"]["array"], dtype=np.float32)
-        sample_rate = example["audio"]["sampling_rate"]
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            return mask
 
-        # Resample if necessary for WebRTC
-        if sample_rate != TARGET_SR:
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=TARGET_SR)
-            sample_rate = TARGET_SR
+        for i in range(len(idx) - 1):
+            gap = idx[i + 1] - idx[i] - 1
+            if 0 < gap <= bridge_gap_frames:
+                mask[idx[i] + 1:idx[i + 1]] = True
 
-        # Truncate audio so it perfectly divides into 30ms frames (prevents reshape crashes)
-        num_frames = len(audio) // frame_length
-        if num_frames == 0: return invalid_clip("too_short")
-        audio = audio[:num_frames * frame_length]
+        return mask
 
-        frames = audio.reshape(-1, frame_length)
-        frame_powers = np.mean(frames ** 2, axis=1)
-
-        # Convert to 16-bit PCM for WebRTC
-        pcm_audio = (audio * 32767).astype(np.int16).reshape(-1, frame_length)
-        vad = webrtcvad.Vad(VAD_MODE)
-        
-        speech_mask = np.array(
-            [vad.is_speech(frame.tobytes(), sample_rate) for frame in pcm_audio],
-            dtype=bool,
-        )
-
-        speech_seconds = np.sum(speech_mask) * (frame_duration_ms / 1000.0)
-        speech_ratio = np.mean(speech_mask)
-        
-        if speech_ratio == 0: return invalid_clip("no_speech")
+    def score_clip(audio_16k, speech_mask):
+        frames = audio_16k.reshape(-1, FRAME_LEN)
+        frame_powers = np.mean(frames.astype(np.float32) ** 2, axis=1)
 
         speech_powers = frame_powers[speech_mask]
         non_speech_powers = frame_powers[~speech_mask]
 
-        # Estimate noise floor using the quietest percentiles
-        if non_speech_powers.size >= 3:
-            quiet_count = max(1, int(np.ceil(non_speech_powers.size * 0.2)))
-            noise_candidates = np.partition(non_speech_powers, quiet_count - 1)[:quiet_count]
-            noise_source = "non_speech_floor"
+        if speech_powers.size == 0:
+            return None
+
+        speech_seconds = speech_powers.size * (FRAME_MS / 1000.0)
+        speech_ratio = speech_powers.size / len(frame_powers)
+
+        if speech_seconds < 1.0:
+            return None
+
+        if non_speech_powers.size >= 4:
+            quiet_n = max(1, int(np.ceil(non_speech_powers.size * 0.2)))
+            noise_floor = np.mean(np.partition(non_speech_powers, quiet_n - 1)[:quiet_n])
+            reliability_penalty = 0.0
         else:
-            # Fallback for tightly trimmed clips
-            quiet_count = max(1, int(np.ceil(len(frame_powers) * 0.1)))
-            noise_candidates = np.partition(frame_powers, quiet_count - 1)[:quiet_count]
-            noise_source = "clip_floor"
+            quiet_n = max(1, int(np.ceil(len(frame_powers) * 0.1)))
+            noise_floor = np.mean(np.partition(frame_powers, quiet_n - 1)[:quiet_n])
+            reliability_penalty = 3.0
 
-        signal_power = float(np.mean(speech_powers))
-        noise_power = float(np.mean(noise_candidates))
-        snr_score = float(10 * np.log10((signal_power + EPSILON) / (noise_power + EPSILON)))
+        signal_power = np.mean(speech_powers)
+        snr_db = 10.0 * np.log10((signal_power + 1e-10) / (noise_floor + 1e-10))
 
-        # Penalize clips that are badly trimmed
-        reliability_penalty = 0.0
-        if speech_ratio < 0.35: reliability_penalty += (0.35 - speech_ratio) * 20.0
-        if speech_ratio > 0.95: reliability_penalty += (speech_ratio - 0.95) * 40.0
-        if noise_source == "clip_floor": reliability_penalty += 3.0
+        if speech_ratio < 0.35:
+            reliability_penalty += (0.35 - speech_ratio) * 20.0
+        if speech_ratio > 0.95:
+            reliability_penalty += (speech_ratio - 0.95) * 40.0
 
-        quality_score = snr_score - reliability_penalty
-        
-        return {
-            "snr_score": snr_score,
-            "quality_score": quality_score,
-            "speech_seconds": speech_seconds,
-            "speech_ratio": speech_ratio,
-            "noise_source": noise_source,
+        quality_score = snr_db - reliability_penalty
+        return quality_score, snr_db, speech_ratio, speech_seconds
+
+    top_k = []
+    fallback_k = []
+    K = 5000
+    counter = 0
+
+    def push_candidate(heap, score, record):
+        if len(heap) < K:
+            heapq.heappush(heap, (score, counter, record))
+        elif score > heap[0][0]:
+            heapq.heapreplace(heap, (score, counter, record))
+
+    print(f"🧮 Refining {len(dataset)} records...")
+    for item in dataset:
+        audio = np.array(item["audio"]["array"], dtype=np.float32)
+        sr = item["audio"]["sampling_rate"]
+
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        audio = np.nan_to_num(audio, copy=False)
+
+        duration = len(audio) / sr
+        if not (5.0 <= duration <= 22.0):
+            continue
+
+        audio_16k = (
+            librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
+            if sr != TARGET_SR
+            else audio
+        )
+        usable = (len(audio_16k) // FRAME_LEN) * FRAME_LEN
+        if usable < FRAME_LEN:
+            continue
+
+        audio_16k = np.clip(audio_16k[:usable], -1.0, 1.0)
+        pcm = (audio_16k * 32767).astype(np.int16).reshape(-1, FRAME_LEN)
+
+        raw_mask = np.array(
+            [vad.is_speech(frame.tobytes(), TARGET_SR) for frame in pcm],
+            dtype=bool,
+        )
+        mask = smooth_vad_mask(raw_mask)
+
+        if not mask.any():
+            fallback_record = {
+                "audio": {"array": audio, "sampling_rate": sr},
+                "transcription": item["transcription"],
+                "quality_score": -1_000_000.0,
+                "snr_db": -999.0,
+                "speech_ratio": 0.0,
+                "speech_seconds": 0.0,
+                "selection_tier": "fallback_no_speech",
+            }
+            push_candidate(fallback_k, fallback_record["quality_score"], fallback_record)
+            counter += 1
+            continue
+
+        idx = np.where(mask)[0]
+        frame_sec = FRAME_MS / 1000.0
+        buffer_sec = 0.4
+
+        start_sec = max(0.0, idx[0] * frame_sec - buffer_sec)
+        end_sec = min(len(audio_16k) / TARGET_SR, (idx[-1] + 1) * frame_sec + buffer_sec)
+
+        start = int(start_sec * sr)
+        end = min(len(audio), int(end_sec * sr))
+        trimmed_audio = audio[start:end]
+        if len(trimmed_audio) == 0:
+            fallback_record = {
+                "audio": {"array": audio, "sampling_rate": sr},
+                "transcription": item["transcription"],
+                "quality_score": -900_000.0,
+                "snr_db": -999.0,
+                "speech_ratio": float(np.mean(mask)),
+                "speech_seconds": 0.0,
+                "selection_tier": "fallback_empty_trim",
+            }
+            push_candidate(fallback_k, fallback_record["quality_score"], fallback_record)
+            counter += 1
+            continue
+
+        metrics = score_clip(audio_16k, mask)
+        if metrics is None:
+            fallback_record = {
+                "audio": {"array": trimmed_audio, "sampling_rate": sr},
+                "transcription": item["transcription"],
+                "quality_score": -500_000.0 + float(np.mean(mask)),
+                "snr_db": -999.0,
+                "speech_ratio": float(np.mean(mask)),
+                "speech_seconds": float(np.sum(mask) * (FRAME_MS / 1000.0)),
+                "selection_tier": "fallback_low_confidence",
+            }
+            push_candidate(fallback_k, fallback_record["quality_score"], fallback_record)
+            counter += 1
+            continue
+        quality_score, snr_db, speech_ratio, speech_seconds = metrics
+
+        record = {
+            "audio": {"array": trimmed_audio, "sampling_rate": sr},
+            "transcription": item["transcription"],
+            "quality_score": float(quality_score),
+            "snr_db": float(snr_db),
+            "speech_ratio": float(speech_ratio),
+            "speech_seconds": float(speech_seconds),
+            "selection_tier": "primary",
         }
 
-    print("🧮 Layer 2: Running WebRTC VAD Quality Analysis (Cloud Parallel)...")
-    dataset = dataset.map(calculate_quality, num_proc=8)
+        push_candidate(top_k, quality_score, record)
+        counter += 1
+
+    refined_pool = [x[2] for x in sorted(top_k, key=lambda x: x[0], reverse=True)]
+    if len(refined_pool) < K:
+        fallback_pool = [x[2] for x in sorted(fallback_k, key=lambda x: x[0], reverse=True)]
+        needed = K - len(refined_pool)
+        refined_pool.extend(fallback_pool[:needed])
+
+    if len(refined_pool) < K:
+        print(f"⚠️ Only {len(refined_pool)} clips available after fallback fill.")
+    else:
+        fallback_count = sum(1 for record in refined_pool if record["selection_tier"] != "primary")
+        print(f"✅ Final refined pool size: {len(refined_pool)} ({fallback_count} fallback clips used)")
+
+    top_ds = Dataset.from_list(refined_pool)
+
+    splits = top_ds.train_test_split(test_size=1000)
+    test_valid = splits["test"].train_test_split(test_size=500)
+
+    refined_dict = DatasetDict({
+        "train": splits["train"],
+        "test": test_valid["test"],
+        "valid": test_valid["train"]
+    })
+
+    print("💾 Saving Refined dataset to sna-refined-vol...")
+    refined_dict.save_to_disk("/refined/sna_refined_v1")
+    refined_vol.commit()
     
-    print("🗑️ Removing invalid/silent clips...")
-    dataset = dataset.filter(lambda x: x["quality_score"] > -999.0, num_proc=8)
-
-    # ==========================================
-    # LAYER 3: Rank and Publish
-    # ==========================================
-    print("🏆 Layer 3: Selecting top 5,000 elite clips...")
-    dataset = dataset.sort("quality_score", reverse=True)
-    final_set = dataset.select(range(min(5000, len(dataset))))
-
-    repo_id = f"{hf_user}/shona-tts-dataset-curated"
-    print(f"☁️ Pushing final Gold Standard dataset to https://huggingface.co/datasets/{repo_id}...")
-    final_set.push_to_hub(repo_id, private=False)
-    print("✅ Process complete!")
+    repo_id = f"{os.environ['HF_USERNAME']}/sna-tts-refined-v1"
+    refined_dict.push_to_hub(repo_id)
+    print(f"✅ Refined data available at {repo_id} and in sna-refined-vol")
 
 if __name__ == "__main__":
-    curate_and_push_dataset.remote()
+    refine_shona_dataset.remote()
